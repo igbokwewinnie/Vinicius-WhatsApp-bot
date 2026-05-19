@@ -3,12 +3,12 @@ const nextConfig = {
   experimental: {
     serverComponentsExternalPackages: [
       "@langchain/groq",
-      "@langchain/langgraph",
+      "@langchain/langgraph", 
       "@langchain/core",
       "langchain",
-      "twilio",
-    ],
-  },
-};
+      "twilio"
+    ]
+  }
+}
 
-module.exports = nextConfig;
+module.exports = nextConfig
