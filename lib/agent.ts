@@ -1,16 +1,12 @@
-import {
-  AIMessage,
-  BaseMessage,
-  HumanMessage,
-  SystemMessage,
-} from "@langchain/core/messages";
-import { ChatGroq } from "@langchain/groq";
+import { BaseMessage, HumanMessage } from "@langchain/core/messages";
 import { Annotation, END, StateGraph } from "@langchain/langgraph";
+import { ChatGroq } from "@langchain/groq";
+import { supabaseServer } from "./supabase-server";
 import fs from "fs";
 import path from "path";
-import { supabaseServer } from "./supabase-server";
 
-export interface VinciState {
+// ── State ────────────────────────────────────────────────────
+interface VinciState {
   messages: BaseMessage[];
   phone_number: string;
   intent: "faq" | "booking" | "support" | "escalate" | "unknown";
@@ -20,14 +16,13 @@ export interface VinciState {
     | "division"
     | "purpose"
     | "date"
-    | "time"
-    | "confirm";
+    | "time";
   booking_data: {
     full_name?: string;
     division?: string;
+    purpose?: string;
     preferred_date?: string;
     preferred_time?: string;
-    purpose?: string;
   };
   is_spam: boolean;
   is_rate_limited: boolean;
@@ -35,23 +30,475 @@ export interface VinciState {
   final_response: string;
 }
 
-export type AgentRunResult = {
-  reply: string;
-  bookingStep: VinciState["booking_step"];
-  bookingData: VinciState["booking_data"];
-  intent: VinciState["intent"];
-};
-
-const agentPromptPath = path.join(process.cwd(), "AGENT_PROMPT.md");
-const agentPrompt = fs.existsSync(agentPromptPath)
-  ? fs.readFileSync(agentPromptPath, "utf8")
-  : "You are VINCI, the Vinicius Group assistant.";
-
+// ── LLM ─────────────────────────────────────────────────────
 const llm = new ChatGroq({
   apiKey: process.env.GROQ_API_KEY,
-  model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
-  temperature: 0.3,
+  model: "llama-3.3-70b-versatile",
+  temperature: 0.4,
 });
+
+// ── Agent prompt ─────────────────────────────────────────────
+const agentPrompt = fs.readFileSync(
+  path.join(process.cwd(), "AGENT_PROMPT.md"),
+  "utf-8",
+);
+
+// ── Helpers ──────────────────────────────────────────────────
+
+// Parse flexible date input into YYYY-MM-DD
+async function parseDate(input: string): Promise<string | null> {
+  const res = await llm.invoke([
+    {
+      role: "system",
+      content: `Convert the user's date input to YYYY-MM-DD format.
+Accept any reasonable date format: "12 June 2026", "12/06/2026",
+"June 12 2026", "12-06-2026", etc.
+If it is a valid date reply with ONLY the date in YYYY-MM-DD format.
+If it is not a recognizable date reply with the word: invalid`,
+    },
+    { role: "user", content: input },
+  ]);
+  const result = (res.content as string).trim();
+  return result === "invalid" ? null : result;
+}
+
+// Parse flexible time input into HH:MM
+async function parseTime(input: string): Promise<string | null> {
+  const res = await llm.invoke([
+    {
+      role: "system",
+      content: `Convert the user's time input to HH:MM 24-hour format.
+Accept any reasonable time: "9am", "09:00am", "9:00", "14:00", "2pm", etc.
+Only accept times between 08:00 and 17:00.
+If valid reply with ONLY the time in HH:MM format.
+If invalid or outside business hours reply with the word: invalid`,
+    },
+    { role: "user", content: input },
+  ]);
+  const result = (res.content as string).trim();
+  return result === "invalid" ? null : result;
+}
+
+// Search knowledge base
+async function searchKnowledgeBase(query: string): Promise<string> {
+  const keywords = query
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, "")
+    .split(" ")
+    .filter((w) => w.length > 3)
+    .slice(0, 5);
+
+  const orConditions = keywords
+    .map((k) => `question.ilike.%${k}%,answer.ilike.%${k}%`)
+    .join(",");
+
+  const { data } = await supabaseServer
+    .from("knowledge_base")
+    .select("question, answer, category")
+    .or(orConditions)
+    .limit(4);
+
+  if (!data || data.length === 0) return "";
+  return data.map((r) => `Q: ${r.question}\nA: ${r.answer}`).join("\n\n");
+}
+
+// Check if user wants to exit booking flow
+async function checkBookingExit(
+  message: string,
+  currentStep: string,
+): Promise<"continue" | "question" | "escalate" | "cancel"> {
+  const res = await llm.invoke([
+    {
+      role: "system",
+      content: `The user is booking an appointment. Current step: "${currentStep}".
+Expected input: ${
+        currentStep === "name"
+          ? "their full name"
+          : currentStep === "division"
+            ? "a division name or number 1-6"
+            : currentStep === "purpose"
+              ? "meeting purpose"
+              : currentStep === "date"
+                ? "a date"
+                : "a time"
+      }.
+
+Classify as:
+- "continue" if the message is answering the current booking question
+- "question" if the message is asking about something unrelated to booking
+- "escalate" if the message mentions contracts, legal issues, pricing negotiations, or explicitly wants a human
+- "cancel" if the user wants to stop booking entirely
+
+Reply with only one word.`,
+    },
+    { role: "user", content: message },
+  ]);
+  const r = (res.content as string).toLowerCase().trim();
+  if (["continue", "question", "escalate", "cancel"].includes(r))
+    return r as "continue" | "question" | "escalate" | "cancel";
+  return "continue";
+}
+
+// ── Nodes ────────────────────────────────────────────────────
+
+async function guardNode(
+  state: VinciState,
+): Promise<Partial<VinciState>> {
+  if (state.is_spam) {
+    return {
+      final_response:
+        "This conversation has been flagged. A team member will review it shortly.",
+    };
+  }
+  if (state.is_rate_limited) {
+    return {
+      final_response:
+        "You are sending messages too quickly. Please wait a moment and try again.",
+    };
+  }
+  return {};
+}
+
+async function classifyNode(
+  state: VinciState,
+): Promise<Partial<VinciState>> {
+  const lastMessage =
+    state.messages[state.messages.length - 1].content as string;
+
+  // If already in booking flow, stay in booking
+  if (state.booking_step !== "idle") {
+    return { intent: "booking" };
+  }
+
+  const res = await llm.invoke([
+    {
+      role: "system",
+      content: `Classify this message into exactly one intent:
+- faq: questions about Vinicius Group, its services, divisions, location, contacts
+- booking: user wants to book or schedule a meeting or appointment,
+  or says "continue my booking" or "resume booking"
+- support: complaints or follow-ups about something specific
+- escalate: contracts, legal disputes, procurement tenders, or explicitly wants a human
+
+Reply with only one word.`,
+    },
+    { role: "user", content: lastMessage },
+  ]);
+
+  const intent = (res.content as string).toLowerCase().trim();
+  const valid = ["faq", "booking", "support", "escalate"];
+  return {
+    intent: valid.includes(intent)
+      ? (intent as VinciState["intent"])
+      : "faq",
+  };
+}
+
+async function faqNode(state: VinciState): Promise<Partial<VinciState>> {
+  const lastMessage =
+    state.messages[state.messages.length - 1].content as string;
+
+  const context = await searchKnowledgeBase(lastMessage);
+
+  const systemContent =
+    agentPrompt +
+    (context
+      ? `\n\nKNOWLEDGE BASE CONTEXT (use this to answer):\n${context}`
+      : "\n\nNo specific context found. Answer helpfully from general knowledge about the company.");
+
+  const res = await llm.invoke([
+    { role: "system", content: systemContent },
+    { role: "user", content: lastMessage },
+  ]);
+
+  return { final_response: res.content as string };
+}
+
+async function bookingNode(
+  state: VinciState,
+): Promise<Partial<VinciState>> {
+  const lastMessage = (
+    state.messages[state.messages.length - 1].content as string
+  ).trim();
+
+  // Check if user wants to exit the flow mid-booking
+  if (state.booking_step !== "idle") {
+    const exitIntent = await checkBookingExit(
+      lastMessage,
+      state.booking_step,
+    );
+
+    if (exitIntent === "question") {
+      const context = await searchKnowledgeBase(lastMessage);
+      const stepReminders: Record<string, string> = {
+        name: "By the way, I still need your full name to continue the booking.",
+        division:
+          "When you are ready, please let me know which division you would like to meet with.",
+        purpose:
+          "When you are ready, please tell me the purpose of your visit.",
+        date: "When you are ready, please provide your preferred date.",
+        time: "When you are ready, please provide your preferred time.",
+      };
+      const res = await llm.invoke([
+        {
+          role: "system",
+          content:
+            agentPrompt +
+            (context ? `\n\nCONTEXT:\n${context}` : "") +
+            `\n\nAnswer the user's question naturally. At the end, gently remind them: "${
+              stepReminders[state.booking_step] ?? ""
+            }"`,
+        },
+        { role: "user", content: lastMessage },
+      ]);
+      return {
+        booking_step: state.booking_step,
+        booking_data: state.booking_data,
+        final_response: res.content as string,
+      };
+    }
+
+    if (exitIntent === "escalate") {
+      await supabaseServer
+        .from("conversations")
+        .update({ status: "escalated" })
+        .eq("phone_number", state.phone_number);
+
+      await supabaseServer.from("audit_logs").insert({
+        event_type: "conversation_escalated",
+        metadata: {
+          phone_number: state.phone_number,
+          reason: "switched_from_booking",
+          saved_progress: state.booking_data,
+        },
+      });
+
+      const saved = [
+        state.booking_data.full_name
+          ? `Name: ${state.booking_data.full_name}`
+          : "",
+        state.booking_data.division
+          ? `Division: ${state.booking_data.division}`
+          : "",
+        state.booking_data.purpose
+          ? `Purpose: ${state.booking_data.purpose}`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      return {
+        intent: "escalate",
+        booking_step: "idle",
+        booking_data: {},
+        escalated: true,
+        final_response:
+          `Understood. I am connecting you with a member of the Vinicius Group team who will follow up with you directly.\n\n` +
+          (saved ? `I have saved your booking progress:\n${saved}\n\n` : "") +
+          `Whenever you are ready to continue booking your appointment, just say "continue my booking".`,
+      };
+    }
+
+    if (exitIntent === "cancel") {
+      return {
+        booking_step: "idle",
+        booking_data: {},
+        final_response:
+          "No problem, I have cancelled the booking. Is there anything else I can help you with?",
+      };
+    }
+    // exitIntent === "continue" — proceed with normal step logic
+  }
+
+  // Step: idle — start booking
+  if (state.booking_step === "idle") {
+    return {
+      booking_step: "name",
+      final_response:
+        "I would be happy to help you book an appointment with Vinicius Group. Could I start with your full name please?",
+    };
+  }
+
+  // Step: name
+  if (state.booking_step === "name") {
+    return {
+      booking_step: "division",
+      booking_data: { ...state.booking_data, full_name: lastMessage },
+      final_response: `Thank you, ${lastMessage}. Which division would you like to meet with?\n\n1. Defence & Security\n2. Infrastructure\n3. Aviation\n4. Technology\n5. Automobile\n6. Agro-Industrial\n\nYou can type the number or the name.`,
+    };
+  }
+
+  // Step: division
+  if (state.booking_step === "division") {
+    const divisionMap: Record<string, string> = {
+      "1": "Defence & Security",
+      "2": "Infrastructure",
+      "3": "Aviation",
+      "4": "Technology",
+      "5": "Automobile",
+      "6": "Agro-Industrial",
+    };
+    const division = divisionMap[lastMessage.trim()] || lastMessage;
+    return {
+      booking_step: "purpose",
+      booking_data: { ...state.booking_data, division },
+      final_response: `Got it — ${division}. What is the purpose of this meeting? A brief description is fine.`,
+    };
+  }
+
+  // Step: purpose
+  if (state.booking_step === "purpose") {
+    return {
+      booking_step: "date",
+      booking_data: { ...state.booking_data, purpose: lastMessage },
+      final_response:
+        "What is your preferred date? You can write it naturally, for example: 25 June 2026 or 25/06/2026.",
+    };
+  }
+
+  // Step: date — flexible parsing
+  if (state.booking_step === "date") {
+    const parsed = await parseDate(lastMessage);
+    if (!parsed) {
+      return {
+        booking_step: "date",
+        booking_data: state.booking_data,
+        final_response:
+          "I could not quite read that date. Could you try again? For example: 25 June 2026 or 25/06/2026. We are available Monday to Friday.",
+      };
+    }
+    return {
+      booking_step: "time",
+      booking_data: { ...state.booking_data, preferred_date: parsed },
+      final_response:
+        "What time would you prefer? For example: 9am, 10:30, or 14:00. We are available between 8am and 5pm WAT.",
+    };
+  }
+
+  // Step: time — flexible parsing
+  if (state.booking_step === "time") {
+    const parsed = await parseTime(lastMessage);
+    if (!parsed) {
+      return {
+        booking_step: "time",
+        booking_data: state.booking_data,
+        final_response:
+          "I could not read that time. Please provide a time between 8am and 5pm, for example: 9am, 10:30, or 14:00.",
+      };
+    }
+
+    const { data: conversation } = await supabaseServer
+      .from("conversations")
+      .select("id")
+      .eq("phone_number", state.phone_number)
+      .single();
+
+    const bookingPayload = {
+      conversation_id: conversation?.id ?? null,
+      full_name: state.booking_data.full_name ?? "",
+      phone_number: state.phone_number,
+      division: state.booking_data.division ?? "general",
+      purpose: state.booking_data.purpose ?? "",
+      preferred_date: state.booking_data.preferred_date ?? "",
+      preferred_time: parsed,
+      status: "pending",
+    };
+
+    await supabaseServer.from("appointments").insert(bookingPayload);
+    await supabaseServer.from("audit_logs").insert({
+      event_type: "appointment_booked",
+      metadata: bookingPayload,
+    });
+
+    return {
+      booking_step: "idle",
+      booking_data: {},
+      final_response:
+        `Your appointment has been booked.\n\n` +
+        `Here is your summary:\n` +
+        `Name: ${state.booking_data.full_name}\n` +
+        `Division: ${state.booking_data.division}\n` +
+        `Date: ${state.booking_data.preferred_date}\n` +
+        `Time: ${parsed}\n` +
+        `Purpose: ${state.booking_data.purpose}\n\n` +
+        `Our team will be in touch to confirm. Is there anything else I can help you with?`,
+    };
+  }
+
+  return {
+    final_response:
+      "Something went wrong with the booking. Please say 'book appointment' to start again.",
+  };
+}
+
+async function supportNode(
+  state: VinciState,
+): Promise<Partial<VinciState>> {
+  const lastMessage =
+    state.messages[state.messages.length - 1].content as string;
+  const context = await searchKnowledgeBase(lastMessage);
+
+  const res = await llm.invoke([
+    {
+      role: "system",
+      content:
+        agentPrompt +
+        (context ? `\n\nCONTEXT:\n${context}` : "") +
+        "\n\nYou are handling a support request. Be empathetic and solution-focused. If you cannot resolve it, offer to connect them with the team naturally — do not ask permission to escalate, just offer it once as an option.",
+    },
+    { role: "user", content: lastMessage },
+  ]);
+
+  return { final_response: res.content as string };
+}
+
+async function escalateNode(
+  state: VinciState,
+): Promise<Partial<VinciState>> {
+  await supabaseServer
+    .from("conversations")
+    .update({ status: "escalated" })
+    .eq("phone_number", state.phone_number);
+
+  await supabaseServer.from("audit_logs").insert({
+    event_type: "conversation_escalated",
+    metadata: {
+      phone_number: state.phone_number,
+      reason: "direct_escalation",
+    },
+  });
+
+  return {
+    escalated: true,
+    final_response:
+      "Thank you for reaching out. I am connecting you with a member of the Vinicius Group team who will follow up with you directly. Please expect a response within one business hour.",
+  };
+}
+
+async function respondNode(
+  state: VinciState,
+): Promise<Partial<VinciState>> {
+  console.log("VINCI responding:", {
+    phone: state.phone_number,
+    intent: state.intent,
+    response: state.final_response,
+  });
+  return {};
+}
+
+// ── Routing ──────────────────────────────────────────────────
+
+function routeAfterGuard(state: VinciState): string {
+  if (state.is_spam || state.is_rate_limited) return "blocked";
+  return "classify";
+}
+
+function routeIntent(state: VinciState): string {
+  const valid = ["faq", "booking", "support", "escalate"];
+  return valid.includes(state.intent) ? state.intent : "faq";
+}
+
+// ── Graph ────────────────────────────────────────────────────
 
 const VinciStateAnnotation = Annotation.Root({
   messages: Annotation<BaseMessage[]>({
@@ -64,11 +511,11 @@ const VinciStateAnnotation = Annotation.Root({
   }),
   intent: Annotation<VinciState["intent"]>({
     reducer: (x, y) => y ?? x,
-    default: () => "unknown" as const,
+    default: () => "unknown",
   }),
   booking_step: Annotation<VinciState["booking_step"]>({
     reducer: (x, y) => y ?? x,
-    default: () => "idle" as const,
+    default: () => "idle",
   }),
   booking_data: Annotation<VinciState["booking_data"]>({
     reducer: (x, y) => y ?? x,
@@ -91,463 +538,6 @@ const VinciStateAnnotation = Annotation.Root({
     default: () => "",
   }),
 });
-
-function messageContent(message: BaseMessage): string {
-  const content = message.content;
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => {
-        if (typeof part === "string") return part;
-        if (part && typeof part === "object" && "text" in part) {
-          return String((part as { text?: string }).text ?? "");
-        }
-        return "";
-      })
-      .join(" ")
-      .trim();
-  }
-  return String(content ?? "");
-}
-
-function getLastUserMessage(state: VinciState): string {
-  for (let i = state.messages.length - 1; i >= 0; i--) {
-    const msg = state.messages[i];
-    if (msg instanceof HumanMessage || msg.getType() === "human") {
-      return messageContent(msg);
-    }
-  }
-  return "";
-}
-
-function llmText(content: unknown): string {
-  if (typeof content === "string") return content.trim();
-  return String(content ?? "").trim();
-}
-
-function normalizeDivision(input: string): string {
-  const value = input.trim().toLowerCase();
-  if (value === "1" || value.includes("defence") || value.includes("defense")) {
-    return "defence";
-  }
-  if (value === "2" || value.includes("infrastructure")) return "infrastructure";
-  if (value === "3" || value.includes("aviation")) return "aviation";
-  if (value === "4" || value.includes("technology")) return "technology";
-  if (value === "5" || value.includes("automobile")) return "automobile";
-  if (value === "6" || value.includes("agro")) return "agro";
-  return "general";
-}
-
-function parsePreferredDate(input: string): string | null {
-  const match = input.trim().match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-  if (!match) return null;
-  const [, day, month, year] = match;
-  return `${year}-${month}-${day}`;
-}
-
-function parsePreferredTime(input: string): string | null {
-  const match = input.trim().match(/^(\d{2}):(\d{2})$/);
-  if (!match) return null;
-  const [, hour, minute] = match;
-  const h = Number(hour);
-  const m = Number(minute);
-  if (h < 8 || h > 17 || m < 0 || m > 59) return null;
-  return `${hour}:${minute}:00`;
-}
-
-async function guardNode(state: VinciState): Promise<Partial<VinciState>> {
-  if (state.is_spam) {
-    return {
-      final_response:
-        "This conversation has been flagged. A team member will review it shortly.",
-    };
-  }
-
-  if (state.is_rate_limited) {
-    return {
-      final_response:
-        "You are sending messages too quickly. Please wait a moment and try again.",
-    };
-  }
-
-  return {};
-}
-
-async function classifyNode(state: VinciState): Promise<Partial<VinciState>> {
-  const lastMessage = getLastUserMessage(state);
-  if (!lastMessage) {
-    return { intent: "faq" };
-  }
-
-  try {
-    const response = await llm.invoke([
-      new SystemMessage(
-        `Classify the user message into exactly one of these intents:
-faq, booking, support, escalate.
-Rules:
-- faq: questions about Vinicius Group, its divisions, services, or general info
-- booking: user wants to schedule a meeting, book an appointment, OR says "continue my booking" or "resume my booking"
-- support: complaints, follow-ups, or help with something specific
-- escalate: contracts, pricing, legal matters, or user asks for a human
-Respond with only the single word. Nothing else.`,
-      ),
-      new HumanMessage(lastMessage),
-    ]);
-
-    const raw = llmText(response.content).toLowerCase();
-    const valid = ["faq", "booking", "support", "escalate"] as const;
-    const intent = valid.find((item) => raw.includes(item)) ?? "faq";
-    return { intent };
-  } catch (error) {
-    console.error("classifyNode failed", error);
-    return { intent: "faq" };
-  }
-}
-
-async function searchKnowledgeBase(userMessage: string) {
-  const keywords = userMessage.split(/\s+/).filter(Boolean).slice(0, 3).join(" ");
-  if (!keywords) {
-    return "No specific information found in knowledge base.";
-  }
-
-  const { data, error } = await supabaseServer
-    .from("knowledge_base")
-    .select("question, answer, category")
-    .or(`question.ilike.%${keywords}%,answer.ilike.%${keywords}%`)
-    .limit(3);
-
-  if (error) {
-    console.error("knowledge_base search failed", error);
-    return "No specific information found in knowledge base.";
-  }
-
-  if (!data?.length) {
-    return "No specific information found in knowledge base.";
-  }
-
-  return data
-    .map((row) => `Q: ${row.question}\nA: ${row.answer}`)
-    .join("\n\n");
-}
-
-async function faqNode(state: VinciState): Promise<Partial<VinciState>> {
-  const lastMessage = getLastUserMessage(state);
-  if (!lastMessage) {
-    return {
-      final_response:
-        "I am unable to retrieve that information right now. Please try again or type 'human' to speak with our team.",
-    };
-  }
-
-  try {
-    const context = await searchKnowledgeBase(lastMessage);
-    const response = await llm.invoke([
-      new SystemMessage(
-        `${agentPrompt}\n\nCONTEXT FROM KNOWLEDGE BASE:\n${context}`,
-      ),
-      new HumanMessage(lastMessage),
-    ]);
-
-    return { final_response: llmText(response.content) };
-  } catch (error) {
-    console.error("faqNode failed", error);
-    return {
-      final_response:
-        "I am unable to retrieve that information right now. Please try again or type 'human' to speak with our team.",
-    };
-  }
-}
-
-async function supportNode(state: VinciState): Promise<Partial<VinciState>> {
-  const lastMessage = getLastUserMessage(state);
-  if (!lastMessage) {
-    return {
-      final_response:
-        "I am unable to retrieve that information right now. Please try again or type 'human' to speak with our team.",
-    };
-  }
-
-  try {
-    const context = await searchKnowledgeBase(lastMessage);
-    const response = await llm.invoke([
-      new SystemMessage(
-        `${agentPrompt}\n\nCONTEXT FROM KNOWLEDGE BASE:\n${context}\n\nYou are handling a customer support request. Be empathetic and solution-focused.
-If you cannot resolve the issue directly, offer to escalate to a human team member.`,
-      ),
-      new HumanMessage(lastMessage),
-    ]);
-
-    return { final_response: llmText(response.content) };
-  } catch (error) {
-    console.error("supportNode failed", error);
-    return {
-      final_response:
-        "I am unable to retrieve that information right now. Please try again or type 'human' to speak with our team.",
-    };
-  }
-}
-
-async function bookingNode(state: VinciState): Promise<Partial<VinciState>> {
-  const lastMessage = getLastUserMessage(state);
-  const step = state.booking_step;
-
-  // If user is mid-booking but their message suggests a different intent,
-  // check if they want to abandon or switch
-  const midBookingSteps = ["name", "division", "purpose", "date", "time"];
-  const isInBookingFlow = midBookingSteps.includes(state.booking_step);
-  let abandonAndAnswerFaq = false;
-
-  if (isInBookingFlow) {
-    const exitCheckResponse = await llm.invoke([
-      new SystemMessage(
-        `The user is in the middle of booking an appointment.
-Determine if their latest message is:
-1. "continue" - they are answering the booking question normally
-2. "escalate" - they want to speak to a human or discuss contracts/legal/pricing
-3. "abandon" - they want to stop booking and ask something else entirely
-
-Reply with only one word: continue, escalate, or abandon.`,
-      ),
-      new HumanMessage(lastMessage),
-    ]);
-
-    const exitIntent = llmText(exitCheckResponse.content).toLowerCase().trim();
-
-    if (exitIntent === "escalate") {
-      await supabaseServer
-        .from("conversations")
-        .update({ status: "escalated" })
-        .eq("phone_number", state.phone_number);
-
-      await supabaseServer.from("audit_logs").insert({
-        event_type: "conversation_escalated",
-        metadata: {
-          phone_number: state.phone_number,
-          reason: "user_switched_from_booking",
-          booking_data_saved: state.booking_data,
-        },
-      });
-
-      return {
-        intent: "escalate",
-        booking_step: "idle",
-        booking_data: {},
-        escalated: true,
-        final_response: `I understand. I will connect you with a member of the Vinicius Group team who can assist you directly.\n\nJust so you know, I had saved your booking details so far:\n${
-          state.booking_data.full_name ? `Name: ${state.booking_data.full_name}` : ""
-        }${
-          state.booking_data.division ? `\nDivision: ${state.booking_data.division}` : ""
-        }\n\nWhen you are ready to continue booking, simply say "I want to book an appointment" and we can pick up from there.\n\n— VINCI`,
-      };
-    }
-
-    if (exitIntent === "abandon") {
-      abandonAndAnswerFaq = true;
-    }
-  }
-
-  if (isInBookingFlow && abandonAndAnswerFaq) {
-    const keywords = lastMessage.split(" ").slice(0, 3).join(" ");
-
-    const { data: kbResults } = await supabaseServer
-      .from("knowledge_base")
-      .select("question, answer, category")
-      .or(`question.ilike.%${keywords}%,answer.ilike.%${keywords}%`)
-      .limit(3);
-
-    const context =
-      kbResults && kbResults.length > 0
-        ? kbResults.map((r) => `Q: ${r.question}\nA: ${r.answer}`).join("\n\n")
-        : "No specific information found in knowledge base.";
-
-    const faqResponse = await llm.invoke([
-      new SystemMessage(
-        `${agentPrompt}\n\nCONTEXT:\n${context}\n\nNote: The user was mid-booking but changed topic. Answer their question, then gently remind them they can say 'continue my booking' to resume their appointment booking.`,
-      ),
-      new HumanMessage(lastMessage),
-    ]);
-
-    return {
-      booking_step: "idle",
-      booking_data: state.booking_data,
-      final_response: llmText(faqResponse.content),
-    };
-  }
-
-  if (step === "idle") {
-    return {
-      booking_step: "name",
-      final_response:
-        "I would be happy to help you book an appointment. May I have your full name please?",
-    };
-  }
-
-  if (step === "name") {
-    return {
-      booking_step: "division",
-      booking_data: { ...state.booking_data, full_name: lastMessage },
-      final_response:
-        "Thank you. Which division would you like to meet with?\n\n1. Defence & Security\n2. Infrastructure\n3. Aviation\n4. Technology\n5. Automobile\n6. Agro-Industrial",
-    };
-  }
-
-  if (step === "division") {
-    return {
-      booking_step: "purpose",
-      booking_data: {
-        ...state.booking_data,
-        division: normalizeDivision(lastMessage),
-      },
-      final_response: "Noted. Briefly, what is the purpose of this meeting?",
-    };
-  }
-
-  if (step === "purpose") {
-    return {
-      booking_step: "date",
-      booking_data: { ...state.booking_data, purpose: lastMessage },
-      final_response:
-        "What is your preferred date? (format: DD/MM/YYYY, Monday to Friday only)",
-    };
-  }
-
-  if (step === "date") {
-    const parsedDate = parsePreferredDate(lastMessage);
-    if (!parsedDate) {
-      return {
-        final_response:
-          "Please provide a valid date in DD/MM/YYYY format (Monday to Friday only).",
-      };
-    }
-
-    return {
-      booking_step: "time",
-      booking_data: {
-        ...state.booking_data,
-        preferred_date: parsedDate,
-      },
-      final_response:
-        "And your preferred time? (format: HH:MM, between 08:00 and 17:00 WAT)",
-    };
-  }
-
-  if (step === "time") {
-    const parsedTime = parsePreferredTime(lastMessage);
-    if (!parsedTime) {
-      return {
-        final_response:
-          "Please provide a valid time in HH:MM format between 08:00 and 17:00 WAT.",
-      };
-    }
-
-    const bookingData = {
-      ...state.booking_data,
-      preferred_time: parsedTime,
-    };
-
-    const { data: conversation, error: conversationError } = await supabaseServer
-      .from("conversations")
-      .select("id")
-      .eq("phone_number", state.phone_number)
-      .maybeSingle();
-
-    if (conversationError || !conversation?.id) {
-      console.error("bookingNode conversation lookup failed", conversationError);
-      return {
-        final_response:
-          "I could not save your appointment right now. Please try again or type 'human' for assistance.",
-      };
-    }
-
-    const { error: appointmentError } = await supabaseServer
-      .from("appointments")
-      .insert({
-        conversation_id: conversation.id,
-        full_name: bookingData.full_name,
-        phone_number: state.phone_number,
-        division: bookingData.division ?? "general",
-        purpose: bookingData.purpose ?? "Meeting",
-        preferred_date: bookingData.preferred_date,
-        preferred_time: bookingData.preferred_time,
-        status: "pending",
-      });
-
-    if (appointmentError) {
-      console.error("bookingNode appointment insert failed", appointmentError);
-      return {
-        final_response:
-          "I could not save your appointment right now. Please try again or type 'human' for assistance.",
-      };
-    }
-
-    await supabaseServer.from("audit_logs").insert({
-      event_type: "appointment_booked",
-      conversation_id: conversation.id,
-      metadata: bookingData,
-    });
-
-    return {
-      booking_step: "idle",
-      booking_data: {},
-      final_response: `Your appointment has been booked successfully.\n\nSummary:\nName: ${bookingData.full_name}\nDivision: ${bookingData.division}\nDate: ${bookingData.preferred_date}\nTime: ${bookingData.preferred_time}\nPurpose: ${bookingData.purpose}\n\nOur team will confirm shortly. Is there anything else I can help you with?\n\n— VINCI`,
-    };
-  }
-
-  return {
-    booking_step: "idle",
-    booking_data: {},
-    final_response:
-      "Let's start your booking again. May I have your full name please?",
-  };
-}
-
-async function escalateNode(state: VinciState): Promise<Partial<VinciState>> {
-  const { data: conversation } = await supabaseServer
-    .from("conversations")
-    .select("id")
-    .eq("phone_number", state.phone_number)
-    .maybeSingle();
-
-  await supabaseServer
-    .from("conversations")
-    .update({ status: "escalated" })
-    .eq("phone_number", state.phone_number);
-
-  await supabaseServer.from("audit_logs").insert({
-    event_type: "conversation_escalated",
-    conversation_id: conversation?.id ?? null,
-    metadata: {
-      phone_number: state.phone_number,
-      reason: "user_or_agent_triggered",
-    },
-  });
-
-  return {
-    escalated: true,
-    final_response:
-      "Thank you for reaching out. I am connecting you with a member of the Vinicius Group team who will follow up with you directly. Please expect a response within one business hour.\n\n— VINCI",
-  };
-}
-
-async function respondNode(state: VinciState): Promise<Partial<VinciState>> {
-  console.log("VINCI responding:", {
-    phone: state.phone_number,
-    intent: state.intent,
-    response: state.final_response,
-  });
-  return {};
-}
-
-function routeAfterGuard(state: VinciState): string {
-  if (state.is_spam || state.is_rate_limited) return "blocked";
-  return "classify";
-}
-
-function routeIntent(state: VinciState): string {
-  if (state.booking_step !== "idle") return "booking";
-  const valid = ["faq", "booking", "support", "escalate"];
-  return valid.includes(state.intent) ? state.intent : "faq";
-}
 
 const workflow = new StateGraph(VinciStateAnnotation)
   .addNode("guard", guardNode)
@@ -576,20 +566,7 @@ const workflow = new StateGraph(VinciStateAnnotation)
 
 export const vinciAgent = workflow.compile();
 
-function buildAgentMessages(
-  userMessage: string,
-  conversationHistory: BaseMessage[],
-): BaseMessage[] {
-  const last = conversationHistory[conversationHistory.length - 1];
-  const lastIsSameUserMessage =
-    last instanceof HumanMessage && messageContent(last) === userMessage;
-
-  if (lastIsSameUserMessage) {
-    return conversationHistory;
-  }
-
-  return [...conversationHistory, new HumanMessage(userMessage)];
-}
+// ── Public API ───────────────────────────────────────────────
 
 export async function runAgent(
   userMessage: string,
@@ -599,11 +576,14 @@ export async function runAgent(
   bookingData: VinciState["booking_data"],
   isSpam: boolean,
   isRateLimited: boolean,
-): Promise<AgentRunResult> {
-  const messages = buildAgentMessages(userMessage, conversationHistory);
-
+): Promise<{
+  reply: string;
+  bookingStep: VinciState["booking_step"];
+  bookingData: VinciState["booking_data"];
+  intent: string;
+}> {
   const result = await vinciAgent.invoke({
-    messages,
+    messages: [...conversationHistory, new HumanMessage(userMessage)],
     phone_number: phoneNumber,
     intent: "unknown",
     booking_step: bookingStep,
@@ -617,9 +597,9 @@ export async function runAgent(
   return {
     reply:
       result.final_response ||
-      "I am sorry, I could not process your request. Please try again.",
-    bookingStep: result.booking_step ?? bookingStep,
-    bookingData: result.booking_data ?? bookingData,
-    intent: result.intent ?? "unknown",
+      "I am sorry, I could not process that. Please try again.",
+    bookingStep: result.booking_step,
+    bookingData: result.booking_data,
+    intent: result.intent,
   };
 }

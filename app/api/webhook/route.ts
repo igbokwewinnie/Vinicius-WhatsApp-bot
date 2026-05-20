@@ -250,8 +250,7 @@ export async function POST(request: Request) {
         | "division"
         | "purpose"
         | "date"
-        | "time"
-        | "confirm") || "idle";
+        | "time") || "idle";
     const bookingData =
       (conversation.booking_data as Record<string, string | undefined>) || {};
 
