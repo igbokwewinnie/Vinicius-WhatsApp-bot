@@ -186,7 +186,7 @@ async function classifyNode(state: VinciState): Promise<Partial<VinciState>> {
 faq, booking, support, escalate.
 Rules:
 - faq: questions about Vinicius Group, its divisions, services, or general info
-- booking: user wants to schedule a meeting or appointment
+- booking: user wants to schedule a meeting, book an appointment, OR says "continue my booking" or "resume my booking"
 - support: complaints, follow-ups, or help with something specific
 - escalate: contracts, pricing, legal matters, or user asks for a human
 Respond with only the single word. Nothing else.`,
@@ -290,6 +290,89 @@ If you cannot resolve the issue directly, offer to escalate to a human team memb
 async function bookingNode(state: VinciState): Promise<Partial<VinciState>> {
   const lastMessage = getLastUserMessage(state);
   const step = state.booking_step;
+
+  // If user is mid-booking but their message suggests a different intent,
+  // check if they want to abandon or switch
+  const midBookingSteps = ["name", "division", "purpose", "date", "time"];
+  const isInBookingFlow = midBookingSteps.includes(state.booking_step);
+  let abandonAndAnswerFaq = false;
+
+  if (isInBookingFlow) {
+    const exitCheckResponse = await llm.invoke([
+      new SystemMessage(
+        `The user is in the middle of booking an appointment.
+Determine if their latest message is:
+1. "continue" - they are answering the booking question normally
+2. "escalate" - they want to speak to a human or discuss contracts/legal/pricing
+3. "abandon" - they want to stop booking and ask something else entirely
+
+Reply with only one word: continue, escalate, or abandon.`,
+      ),
+      new HumanMessage(lastMessage),
+    ]);
+
+    const exitIntent = llmText(exitCheckResponse.content).toLowerCase().trim();
+
+    if (exitIntent === "escalate") {
+      await supabaseServer
+        .from("conversations")
+        .update({ status: "escalated" })
+        .eq("phone_number", state.phone_number);
+
+      await supabaseServer.from("audit_logs").insert({
+        event_type: "conversation_escalated",
+        metadata: {
+          phone_number: state.phone_number,
+          reason: "user_switched_from_booking",
+          booking_data_saved: state.booking_data,
+        },
+      });
+
+      return {
+        intent: "escalate",
+        booking_step: "idle",
+        booking_data: {},
+        escalated: true,
+        final_response: `I understand. I will connect you with a member of the Vinicius Group team who can assist you directly.\n\nJust so you know, I had saved your booking details so far:\n${
+          state.booking_data.full_name ? `Name: ${state.booking_data.full_name}` : ""
+        }${
+          state.booking_data.division ? `\nDivision: ${state.booking_data.division}` : ""
+        }\n\nWhen you are ready to continue booking, simply say "I want to book an appointment" and we can pick up from there.\n\n— VINCI`,
+      };
+    }
+
+    if (exitIntent === "abandon") {
+      abandonAndAnswerFaq = true;
+    }
+  }
+
+  if (isInBookingFlow && abandonAndAnswerFaq) {
+    const keywords = lastMessage.split(" ").slice(0, 3).join(" ");
+
+    const { data: kbResults } = await supabaseServer
+      .from("knowledge_base")
+      .select("question, answer, category")
+      .or(`question.ilike.%${keywords}%,answer.ilike.%${keywords}%`)
+      .limit(3);
+
+    const context =
+      kbResults && kbResults.length > 0
+        ? kbResults.map((r) => `Q: ${r.question}\nA: ${r.answer}`).join("\n\n")
+        : "No specific information found in knowledge base.";
+
+    const faqResponse = await llm.invoke([
+      new SystemMessage(
+        `${agentPrompt}\n\nCONTEXT:\n${context}\n\nNote: The user was mid-booking but changed topic. Answer their question, then gently remind them they can say 'continue my booking' to resume their appointment booking.`,
+      ),
+      new HumanMessage(lastMessage),
+    ]);
+
+    return {
+      booking_step: "idle",
+      booking_data: state.booking_data,
+      final_response: llmText(faqResponse.content),
+    };
+  }
 
   if (step === "idle") {
     return {

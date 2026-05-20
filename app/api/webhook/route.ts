@@ -7,7 +7,7 @@ import { sendWhatsAppMessage } from "@/lib/twilio";
 export const runtime = "nodejs";
 
 function ok() {
-  return new Response("OK", { status: 200 });
+  return new Response(null, { status: 200 });
 }
 
 function serializeError(error: unknown) {
@@ -42,6 +42,16 @@ export async function POST(request: Request) {
       profileNameRaw === null ? "" : String(profileNameRaw).trim();
 
     console.log("Webhook POST hit", { from, body, sid });
+
+    // Ignore Twilio system messages
+    const twilioSystemPhrases = ["join ", "stop", "start", "unstop", "help"];
+    const isSystemMessage = twilioSystemPhrases.some((phrase) =>
+      body.toLowerCase().trim().startsWith(phrase),
+    );
+
+    if (isSystemMessage) {
+      return new Response(null, { status: 200 });
+    }
 
     if (!from || !sid) {
       await insertAuditLog({
