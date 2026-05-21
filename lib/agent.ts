@@ -231,13 +231,13 @@ async function bookingNode(
     if (exitIntent === "question") {
       const context = await searchKnowledgeBase(lastMessage);
       const stepReminders: Record<string, string> = {
-        name: "By the way, I still need your full name to continue the booking.",
+        name: "Would you like to continue with your booking? If so, could I get your full name?",
         division:
-          "When you are ready, please let me know which division you would like to meet with.",
+          "Would you like to continue with your booking? If so, which division would you like to meet with?",
         purpose:
-          "When you are ready, please tell me the purpose of your visit.",
-        date: "When you are ready, please provide your preferred date.",
-        time: "When you are ready, please provide your preferred time.",
+          "Would you like to continue with the booking? If so, what is the purpose of your meeting?",
+        date: "Would you like to continue with the booking? If so, what date works for you?",
+        time: "Would you like to continue with the booking? If so, what time works for you?",
       };
       const res = await llm.invoke([
         {
@@ -352,7 +352,7 @@ async function bookingNode(
       booking_step: "date",
       booking_data: { ...state.booking_data, purpose: lastMessage },
       final_response:
-        "What is your preferred date? You can write it naturally, for example: 25 June 2026 or 25/06/2026.",
+        "What is your preferred date?",
     };
   }
 
@@ -371,7 +371,7 @@ async function bookingNode(
       booking_step: "time",
       booking_data: { ...state.booking_data, preferred_date: parsed },
       final_response:
-        "What time would you prefer? For example: 9am, 10:30, or 14:00. We are available between 8am and 5pm WAT.",
+        "What time would you prefer? We are available between 8am and 5pm WAT.",
     };
   }
 
